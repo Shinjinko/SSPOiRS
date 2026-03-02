@@ -1,4 +1,5 @@
-#define NOMINMAX // 1. Исправляет ошибку с std::min и синтаксисом ::
+#define NOMINMAX
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <iostream>
 #include <string>
 #include <vector>
@@ -11,10 +12,10 @@
 #include <map>
 #include <mutex>
 #include <cstring>
-#include <ctime>   // 2. Добавлено для time() и ctime()
+#include <ctime>
+#include <fcntl.h>
 
 #ifdef _WIN32
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -28,15 +29,17 @@ typedef int socklen_t;
 #include <unistd.h>
 #include <netdb.h>
 #include <sys/time.h>
+#include <errno.h>
 typedef int socket_t;
 #define INVALID_SOCKET -1
 #define SOCKET_ERROR -1
 #define closesocket close
 #endif
 
+// Constants
 const int PORT = 12345;
 const int UDP_PORT = 12346;
-const int BUFFER_SIZE = 4096;
+const int BUFFER_SIZE = 4096; // Chunk size to maintain response time
 const int UDP_PAYLOAD_SIZE = 1460;
 const int WINDOW_SIZE = 16;
 const int TIMEOUT_MS = 100;
@@ -44,31 +47,38 @@ const int TIMEOUT_MS = 100;
 #pragma pack(push, 1)
 struct UdpPacket {
     uint32_t seq;
-    uint32_t type;
+    uint32_t type; // 0: DATA, 1: ACK, 2: FIN, 3: START_CMD
     uint32_t dataSize;
     char data[UDP_PAYLOAD_SIZE];
 };
 #pragma pack(pop)
 
-struct TransferState {
-    std::string filename;
-    std::string direction;
-    uint64_t bytesTransferred = 0; // 3. Исправлена ошибка инициализации (type.6)
+// Structure to hold state of each connected TCP client
+struct ClientSession {
+    socket_t socket;
+    std::string ip;
+    std::string cmdBuffer;
+    bool isUploading = false;
+    std::ofstream outFile;
+    uint64_t fileSize = 0;
+    uint64_t bytesReceived = 0;
+    std::string currentFileName;
+    std::chrono::steady_clock::time_point startTime;
 };
-
-std::map<std::string, TransferState> g_transferStates;
-std::mutex g_stateMutex;
 
 struct Command {
     std::string keyword;
     std::vector<std::string> args;
 };
 
-void printError(const std::string& message) {
+// --- Utility Functions ---
+
+void setNonBlocking(socket_t s) {
 #ifdef _WIN32
-    std::cerr << message << " with error code: " << WSAGetLastError() << std::endl;
+    unsigned long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
 #else
-    perror(message.c_str());
+    fcntl(s, F_SETFL, O_NONBLOCK);
 #endif
 }
 
@@ -93,40 +103,177 @@ std::string getBasename(const std::string& path) {
     return (std::string::npos != last_slash) ? path.substr(last_slash + 1) : path;
 }
 
-void setSocketTimeout(socket_t s, int ms) {
-#ifdef _WIN32
-    DWORD timeout = ms;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-#else
-    struct timeval tv;
-    tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#endif
+// --- Lab 3 Multiplexing Logic ---
+
+void handleTcpCommand(ClientSession& session, const Command& cmd) {
+    if (cmd.keyword == "ECHO") {
+        std::string msg = (cmd.args.empty() ? "" : cmd.args[0]) + "\n";
+        send(session.socket, msg.c_str(), (int)msg.length(), 0);
+    }
+    else if (cmd.keyword == "TIME") {
+        time_t now = time(0);
+        std::string t = std::ctime(&now);
+        send(session.socket, t.c_str(), (int)t.length(), 0);
+    }
+    else if (cmd.keyword == "UPLOAD" && cmd.args.size() >= 2) {
+        session.currentFileName = cmd.args[0];
+        session.fileSize = std::stoull(cmd.args[1]);
+        session.isUploading = true;
+        session.bytesReceived = 0;
+        session.outFile.open(session.currentFileName, std::ios::binary | std::ios::trunc);
+        session.startTime = std::chrono::steady_clock::now();
+
+        std::string res = "RESUME 0\n"; // Simplifying for Lab 3 multiplex demo
+        send(session.socket, res.c_str(), (int)res.length(), 0);
+    }
 }
 
-void sendUdpAck(socket_t s, uint32_t seq, const sockaddr_in& addr) {
-    UdpPacket ack;
-    ack.seq = seq; ack.type = 1; ack.dataSize = 0;
-    sendto(s, (const char*)&ack, sizeof(uint32_t) * 3, 0, (const sockaddr*)&addr, sizeof(addr));
+// Sequential processing of a data chunk for a client
+void processClientData(ClientSession& session) {
+    char buffer[BUFFER_SIZE];
+    int r = recv(session.socket, buffer, BUFFER_SIZE, 0);
+
+    if (r <= 0) return; // Error or peer closed handled by main loop
+
+    if (session.isUploading) {
+        session.outFile.write(buffer, r);
+        session.bytesReceived += r;
+        if (session.bytesReceived >= session.fileSize) {
+            session.isUploading = false;
+            session.outFile.close();
+            auto end = std::chrono::steady_clock::now();
+            double duration = std::chrono::duration<double>(end - session.startTime).count();
+            std::cout << "TCP Finished: " << session.currentFileName << " at "
+                << calculateBitrate(session.fileSize, duration) << " Mbps" << std::endl;
+        }
+    }
+    else {
+        for (int i = 0; i < r; ++i) {
+            if (buffer[i] == '\n') {
+                handleTcpCommand(session, parseCommand(session.cmdBuffer));
+                session.cmdBuffer.clear();
+            }
+            else {
+                session.cmdBuffer += buffer[i];
+            }
+        }
+    }
 }
+
+// Global state for UDP (simplified for multiplexing)
+std::ofstream g_udpOutFile;
+uint32_t g_udpExpectedSeq = 0;
+
+void processUdpPacket(socket_t s) {
+    sockaddr_in clientAddr{}; socklen_t addrLen = sizeof(clientAddr);
+    UdpPacket pkt;
+    int bytes = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
+    if (bytes <= 0) return;
+
+    if (pkt.type == 3) { // START
+        g_udpOutFile.close();
+        g_udpOutFile.open("udp_mpx_" + std::string(pkt.data, pkt.dataSize), std::ios::binary);
+        g_udpExpectedSeq = 0;
+        UdpPacket ack{ 0, 1, 0, "" };
+        sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
+    }
+    else if (pkt.type == 0 && g_udpOutFile.is_open()) { // DATA
+        if (pkt.seq == g_udpExpectedSeq) {
+            g_udpOutFile.write(pkt.data, pkt.dataSize);
+            g_udpExpectedSeq++;
+        }
+        UdpPacket ack{ g_udpExpectedSeq - 1, 1, 0, "" };
+        sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
+    }
+    else if (pkt.type == 2) { // FIN
+        g_udpOutFile.close();
+        std::cout << "UDP Multiplexed transfer finished." << std::endl;
+    }
+}
+
+void runServer() {
+    socket_t tcpSrv = socket(AF_INET, SOCK_STREAM, 0);
+    socket_t udpSrv = socket(AF_INET, SOCK_DGRAM, 0);
+
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY;
+
+    addr.sin_port = htons(PORT);
+    bind(tcpSrv, (sockaddr*)&addr, sizeof(addr));
+    listen(tcpSrv, SOMAXCONN);
+
+    addr.sin_port = htons(UDP_PORT);
+    bind(udpSrv, (sockaddr*)&addr, sizeof(addr));
+
+    setNonBlocking(tcpSrv);
+    setNonBlocking(udpSrv);
+
+    std::vector<ClientSession> clients;
+    std::cout << "Single-threaded Multiplexing Server running..." << std::endl;
+
+    while (true) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(tcpSrv, &readfds);
+        FD_SET(udpSrv, &readfds);
+
+        socket_t max_fd = (tcpSrv > udpSrv) ? tcpSrv : udpSrv;
+
+        for (const auto& client : clients) {
+            FD_SET(client.socket, &readfds);
+            if (client.socket > max_fd) max_fd = client.socket;
+        }
+
+        // Multiplexing call
+        if (select((int)max_fd + 1, &readfds, NULL, NULL, NULL) < 0) continue;
+
+        // 1. Check for new TCP connections
+        if (FD_ISSET(tcpSrv, &readfds)) {
+            sockaddr_in ca{}; socklen_t cl = sizeof(ca);
+            socket_t cs = accept(tcpSrv, (sockaddr*)&ca, &cl);
+            if (cs != INVALID_SOCKET) {
+                setNonBlocking(cs);
+                char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, INET_ADDRSTRLEN);
+                clients.push_back({ cs, std::string(ip) });
+                std::cout << "New client: " << ip << std::endl;
+            }
+        }
+
+        // 2. Check for UDP data
+        if (FD_ISSET(udpSrv, &readfds)) {
+            processUdpPacket(udpSrv);
+        }
+
+        // 3. Check for TCP data from existing clients
+        for (auto it = clients.begin(); it != clients.end(); ) {
+            if (FD_ISSET(it->socket, &readfds)) {
+                int peek = recv(it->socket, NULL, 0, MSG_PEEK); // check if closed
+                if (peek == SOCKET_ERROR || (peek == 0)) {
+                    std::cout << "Client disconnected: " << it->ip << std::endl;
+                    closesocket(it->socket);
+                    it = clients.erase(it);
+                    continue;
+                }
+                processClientData(*it);
+            }
+            ++it;
+        }
+    }
+}
+
+// --- Previous Client Code (Stays mostly the same) ---
 
 void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAddr) {
     std::ifstream file(path, std::ios::binary);
-    if (!file) { std::cerr << "File not found." << std::endl; return; }
+    if (!file) return;
 
-    UdpPacket start;
-    start.type = 3;
+    UdpPacket start; start.type = 3;
     std::string name = getBasename(path);
-    // (std::min) в скобках защищает от макроса min
     memcpy(start.data, name.c_str(), (std::min)((size_t)UDP_PAYLOAD_SIZE, name.length()));
     start.dataSize = (uint32_t)name.length();
-    sendto(s, (const char*)&start, sizeof(uint32_t) * 3 + start.dataSize, 0, (const sockaddr*)&destAddr, sizeof(destAddr));
+    sendto(s, (const char*)&start, sizeof(uint32_t) * 3 + start.dataSize, 0, (sockaddr*)&destAddr, sizeof(destAddr));
 
     uint32_t nextSeq = 0, base = 0;
     std::vector<UdpPacket> window(WINDOW_SIZE);
-    auto startTime = std::chrono::high_resolution_clock::now();
-    uint64_t totalSent = 0;
-
     while (!file.eof() || base < nextSeq) {
         while (nextSeq < base + WINDOW_SIZE && !file.eof()) {
             UdpPacket& pkt = window[nextSeq % WINDOW_SIZE];
@@ -134,198 +281,66 @@ void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAdd
             file.read(pkt.data, UDP_PAYLOAD_SIZE);
             pkt.dataSize = (uint32_t)file.gcount();
             if (pkt.dataSize > 0) {
-                sendto(s, (const char*)&pkt, sizeof(uint32_t) * 3 + pkt.dataSize, 0, (const sockaddr*)&destAddr, sizeof(destAddr));
+                sendto(s, (const char*)&pkt, sizeof(uint32_t) * 3 + pkt.dataSize, 0, (sockaddr*)&destAddr, sizeof(destAddr));
                 nextSeq++;
             }
         }
-        UdpPacket ack; sockaddr_in from = { 0 }; socklen_t fromLen = sizeof(from);
+        UdpPacket ack; sockaddr_in from{}; socklen_t fromLen = sizeof(from);
+        struct timeval tv { 0, 100000 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
         if (recvfrom(s, (char*)&ack, sizeof(ack), 0, (sockaddr*)&from, &fromLen) > 0) {
-            if (ack.type == 1 && ack.seq >= base) {
-                totalSent += (ack.seq - base + 1) * UDP_PAYLOAD_SIZE;
-                base = ack.seq + 1;
-            }
+            if (ack.type == 1 && ack.seq >= base) base = ack.seq + 1;
         }
         else {
             for (uint32_t i = base; i < nextSeq; ++i) {
                 UdpPacket& p = window[i % WINDOW_SIZE];
-                sendto(s, (const char*)&p, sizeof(uint32_t) * 3 + p.dataSize, 0, (const sockaddr*)&destAddr, sizeof(destAddr));
+                sendto(s, (const char*)&p, sizeof(uint32_t) * 3 + p.dataSize, 0, (sockaddr*)&destAddr, sizeof(destAddr));
             }
         }
     }
-    UdpPacket fin; fin.type = 2;
-    sendto(s, (const char*)&fin, sizeof(uint32_t) * 3, 0, (const sockaddr*)&destAddr, sizeof(destAddr));
-    auto duration = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - startTime).count();
-    std::cout << "UDP Transfer finished. Bitrate: " << calculateBitrate(totalSent, duration) << " Mbps" << std::endl;
-}
-
-void udpReceiveFile(socket_t s) {
-    sockaddr_in clientAddr = { 0 }; socklen_t addrLen = sizeof(clientAddr);
-    UdpPacket pkt;
-    std::string filename = "received_udp_file.dat";
-    uint32_t expectedSeq = 0;
-    std::ofstream outFile;
-
-    while (true) {
-        int bytes = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
-        if (bytes <= 0) continue;
-        if (pkt.type == 3) {
-            filename = "udp_" + std::string(pkt.data, pkt.dataSize);
-            outFile.open(filename, std::ios::binary);
-            expectedSeq = 0;
-            std::cout << "Receiving UDP file: " << filename << std::endl;
-            sendUdpAck(s, 0, clientAddr);
-        }
-        else if (pkt.type == 0 && outFile.is_open()) {
-            if (pkt.seq == expectedSeq) {
-                outFile.write(pkt.data, pkt.dataSize);
-                sendUdpAck(s, expectedSeq++, clientAddr);
-            }
-            else sendUdpAck(s, expectedSeq - 1, clientAddr);
-        }
-        else if (pkt.type == 2) {
-            if (outFile.is_open()) outFile.close();
-            std::cout << "UDP file " << filename << " saved." << std::endl;
-            break;
-        }
-    }
-}
-
-void handleTcpUpload(socket_t sock, const Command& cmd, const std::string& clientIp) {
-    if (cmd.args.size() < 2) return;
-    std::string filename = cmd.args[0];
-    uint64_t fileSize = std::stoull(cmd.args[1]);
-    uint64_t offset = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        if (g_transferStates.count(clientIp) && g_transferStates[clientIp].filename == filename)
-            offset = g_transferStates[clientIp].bytesTransferred;
-    }
-
-    std::string res = "RESUME " + std::to_string(offset) + "\n";
-    send(sock, res.c_str(), (int)res.length(), 0);
-
-    std::ofstream outFile(filename, std::ios::binary | (offset > 0 ? std::ios::app : std::ios::trunc));
-    char buffer[BUFFER_SIZE];
-    uint64_t received = offset;
-    auto start = std::chrono::high_resolution_clock::now();
-
-    while (received < fileSize) {
-        int r = recv(sock, buffer, BUFFER_SIZE, 0);
-        if (r <= 0) {
-            std::lock_guard<std::mutex> lock(g_stateMutex);
-            g_transferStates[clientIp] = { filename, "UPLOAD", received };
-            return;
-        }
-        outFile.write(buffer, r);
-        received += r;
-    }
-    double d = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
-    std::cout << "TCP Upload complete. Bitrate: " << calculateBitrate(fileSize - offset, d) << " Mbps" << std::endl;
-}
-
-void handleTcpConnection(socket_t clientSocket, std::string clientIp) {
-    char buffer[BUFFER_SIZE];
-    while (true) {
-        int r = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-        if (r <= 0) break;
-        buffer[r] = '\0';
-        Command cmd = parseCommand(buffer);
-
-        if (cmd.keyword == "ECHO") {
-            std::string msg = (cmd.args.empty() ? "" : cmd.args[0]) + "\n";
-            send(clientSocket, msg.c_str(), (int)msg.length(), 0);
-        }
-        else if (cmd.keyword == "TIME") {
-            time_t now = time(0);
-            std::string t = std::ctime(&now);
-            send(clientSocket, t.c_str(), (int)t.length(), 0);
-        }
-        else if (cmd.keyword == "UPLOAD") {
-            handleTcpUpload(clientSocket, cmd, clientIp);
-        }
-        else if (cmd.keyword == "EXIT" || cmd.keyword == "CLOSE") {
-            break;
-        }
-    }
-    closesocket(clientSocket);
-}
-
-void runServer() {
-    // 4. Лямбда-функция вынесена для стабильности в некоторых версиях VS
-    std::thread udpSrv([]() {
-        socket_t s = socket(AF_INET, SOCK_DGRAM, 0);
-        sockaddr_in a = { 0 }; a.sin_family = AF_INET; a.sin_port = htons(UDP_PORT); a.sin_addr.s_addr = INADDR_ANY;
-        bind(s, (struct sockaddr*)&a, sizeof(a));
-        while (true) udpReceiveFile(s);
-        });
-    udpSrv.detach();
-
-    socket_t s = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in a = { 0 }; a.sin_family = AF_INET; a.sin_port = htons(PORT); a.sin_addr.s_addr = INADDR_ANY;
-    bind(s, (struct sockaddr*)&a, sizeof(a));
-    listen(s, SOMAXCONN);
-    std::cout << "Server running. TCP:" << PORT << " UDP:" << UDP_PORT << std::endl;
-
-    while (true) {
-        sockaddr_in ca = { 0 }; socklen_t cl = sizeof(ca);
-        socket_t cs = accept(s, (struct sockaddr*)&ca, &cl);
-        char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, INET_ADDRSTRLEN);
-        std::thread(handleTcpConnection, cs, std::string(ip)).detach();
-    }
+    UdpPacket fin{ 0, 2, 0, "" };
+    sendto(s, (const char*)&fin, sizeof(uint32_t) * 3, 0, (sockaddr*)&destAddr, sizeof(destAddr));
+    std::cout << "UDP Upload finished." << std::endl;
 }
 
 void runClient(const char* ip) {
     socket_t ts = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in sa = { 0 }; sa.sin_family = AF_INET; sa.sin_port = htons(PORT); inet_pton(AF_INET, ip, &sa.sin_addr);
-    if (connect(ts, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) return;
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(PORT); inet_pton(AF_INET, ip, &sa.sin_addr);
+    if (connect(ts, (sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) return;
 
-    std::cout << "Commands: ECHO <msg>, TIME, UPLOAD <path>, UDP_UPLOAD <path>, EXIT" << std::endl;
+    std::cout << "Commands: ECHO, TIME, UPLOAD <path>, UDP_UPLOAD <path>, EXIT" << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
         Command cmd = parseCommand(line);
         if (cmd.keyword == "UDP_UPLOAD" && !cmd.args.empty()) {
             socket_t us = socket(AF_INET, SOCK_DGRAM, 0);
-            setSocketTimeout(us, TIMEOUT_MS);
-            sockaddr_in da = { 0 }; da.sin_family = AF_INET; da.sin_port = htons(UDP_PORT); inet_pton(AF_INET, ip, &da.sin_addr);
+            sockaddr_in da{}; da.sin_family = AF_INET; da.sin_port = htons(UDP_PORT); inet_pton(AF_INET, ip, &da.sin_addr);
             udpSendFile(us, cmd.args[0], da);
             closesocket(us);
         }
         else if (cmd.keyword == "UPLOAD" && !cmd.args.empty()) {
             std::ifstream f(cmd.args[0], std::ios::binary | std::ios::ate);
-            if (!f) {
-                std::cerr << "Local file not found: " << cmd.args[0] << std::endl;
-                continue;
-            }
+            if (!f) continue;
             uint64_t sz = f.tellg(); f.seekg(0);
             std::string h = "UPLOAD " + getBasename(cmd.args[0]) + " " + std::to_string(sz) + "\n";
             send(ts, h.c_str(), (int)h.length(), 0);
-            char rb[100]; int r = recv(ts, rb, 99, 0);
-            if (r > 0) {
-                rb[r] = '\0';
-                Command rc = parseCommand(rb);
-                uint64_t off = (rc.keyword == "RESUME") ? std::stoull(rc.args[0]) : 0;
-                f.seekg(off);
-                char b[BUFFER_SIZE];
-                while (f.read(b, BUFFER_SIZE) || f.gcount() > 0) send(ts, b, (int)f.gcount(), 0);
-                std::cout << "TCP Upload finished." << std::endl;
-            }
+            char b[BUFFER_SIZE];
+            while (f.read(b, BUFFER_SIZE) || f.gcount() > 0) send(ts, b, (int)f.gcount(), 0);
+            std::cout << "TCP Upload initiated." << std::endl;
         }
         else {
             send(ts, (line + "\n").c_str(), (int)line.length() + 1, 0);
-            if (cmd.keyword == "EXIT") break;
             char b[BUFFER_SIZE]; int r = recv(ts, b, BUFFER_SIZE - 1, 0);
             if (r > 0) { b[r] = '\0'; std::cout << "Server: " << b; }
         }
+        if (cmd.keyword == "EXIT") break;
     }
     closesocket(ts);
 }
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
-    WSADATA wsa;
-    // 5. Исправлена проверка возвращаемого значения WSAStartup
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
     if (argc < 2) return 1;
     if (std::string(argv[1]) == "server") runServer();
