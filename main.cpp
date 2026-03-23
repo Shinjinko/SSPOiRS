@@ -13,6 +13,7 @@
 #include <mutex>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -28,6 +29,7 @@ typedef int socklen_t;
 #include <unistd.h>
 #include <netdb.h>
 #include <sys/time.h>
+#include <errno.h>
 typedef int socket_t;
 #define INVALID_SOCKET -1
 #define SOCKET_ERROR -1
@@ -37,15 +39,10 @@ typedef int socket_t;
 // Constants
 const int PORT = 12345;
 const int UDP_PORT = 12346;
-const int BUFFER_SIZE = 4096;
+const int BUFFER_SIZE = 4096; // Chunk size to maintain response time
 const int UDP_PAYLOAD_SIZE = 1460;
 const int WINDOW_SIZE = 16;
 const int TIMEOUT_MS = 100;
-
-// Mutexes for protection (Requirement: Protection Mechanism)
-std::mutex g_udpSocketMutex; // Protects sendto on the shared UDP socket
-std::mutex g_coutMutex;      // Protects console output
-std::mutex g_acceptMutex;    // Protects accept call (if multiple threads were calling it)
 
 #pragma pack(push, 1)
 struct UdpPacket {
@@ -56,12 +53,34 @@ struct UdpPacket {
 };
 #pragma pack(pop)
 
+// Structure to hold state of each connected TCP client
+struct ClientSession {
+    socket_t socket;
+    std::string ip;
+    std::string cmdBuffer;
+    bool isUploading = false;
+    std::ofstream outFile;
+    uint64_t fileSize = 0;
+    uint64_t bytesReceived = 0;
+    std::string currentFileName;
+    std::chrono::steady_clock::time_point startTime;
+};
+
 struct Command {
     std::string keyword;
     std::vector<std::string> args;
 };
 
 // --- Utility Functions ---
+
+void setNonBlocking(socket_t s) {
+#ifdef _WIN32
+    unsigned long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+#else
+    fcntl(s, F_SETFL, O_NONBLOCK);
+#endif
+}
 
 Command parseCommand(const std::string& line) {
     std::istringstream iss(line);
@@ -84,118 +103,130 @@ std::string getBasename(const std::string& path) {
     return (std::string::npos != last_slash) ? path.substr(last_slash + 1) : path;
 }
 
-// --- UDP Threaded Handler (Requirement: Parallel UDP Processing) ---
+// --- Lab 3 Multiplexing Logic ---
 
-void handleUdpTransfer(socket_t s, sockaddr_in clientAddr, std::string filename) {
-    std::lock_guard<std::mutex> lock_out(g_coutMutex);
-    std::cout << "[UDP Thread] Starting transfer of: " << filename << std::endl;
+void handleTcpCommand(ClientSession& session, const Command& cmd) {
+    if (cmd.keyword == "ECHO") {
+        std::string msg = "ECHO: " + (cmd.args.empty() ? "" : cmd.args[0]) + "\n";
+        send(session.socket, msg.c_str(), (int)msg.length(), 0);
+    }
+    else if (cmd.keyword == "TIME") {
+        time_t now = time(0);
+        std::string t = std::ctime(&now);
+        send(session.socket, t.c_str(), (int)t.length(), 0);
+    }
+    else if (cmd.keyword == "UPLOAD" && cmd.args.size() >= 2) {
+        session.currentFileName = cmd.args[0];
+        session.fileSize = std::stoull(cmd.args[1]);
+        session.isUploading = true;
+        session.bytesReceived = 0;
+        session.outFile.open(session.currentFileName, std::ios::binary | std::ios::trunc);
+        session.startTime = std::chrono::steady_clock::now();
 
-    std::ofstream outFile("udp_threaded_" + filename, std::ios::binary);
-    uint32_t expectedSeq = 0;
+        std::string res = "READY\n";
+        send(session.socket, res.c_str(), (int)res.length(), 0);
+    }
+    else if (cmd.keyword == "EXIT" || cmd.keyword == "QUIT" || cmd.keyword == "CLOSE") {
+        std::string msg = "GOODBYE\n";
+        send(session.socket, msg.c_str(), (int)msg.length(), 0);
+        closesocket(session.socket);
+        session.socket = INVALID_SOCKET;
+    }
+    else {
+        std::string msg = "UNKNOWN_COMMAND: " + cmd.keyword + "\n";
+        send(session.socket, msg.c_str(), (int)msg.length(), 0);
+    }
+}
+
+void processClientData(ClientSession& session) {
+    char buffer[BUFFER_SIZE];
+    int r = recv(session.socket, buffer, BUFFER_SIZE, 0);
+
+    if (r <= 0) {
+        // Connection closed or error
+        if (r == 0) {
+            std::cout << "Client disconnected: " << session.ip << std::endl;
+        }
+        closesocket(session.socket);
+        session.socket = INVALID_SOCKET;
+        return;
+    }
+
+    if (session.isUploading) {
+        session.outFile.write(buffer, r);
+        session.bytesReceived += r;
+        if (session.bytesReceived >= session.fileSize) {
+            session.isUploading = false;
+            session.outFile.close();
+            auto end = std::chrono::steady_clock::now();
+            double duration = std::chrono::duration<double>(end - session.startTime).count();
+            std::cout << "TCP Finished: " << session.currentFileName << " at "
+                << calculateBitrate(session.fileSize, duration) << " Mbps" << std::endl;
+            
+            // Send completion notification to client
+            std::string msg = "UPLOAD_COMPLETE\n";
+            send(session.socket, msg.c_str(), (int)msg.length(), 0);
+        }
+    }
+    else {
+        // Append received data to buffer
+        session.cmdBuffer.append(buffer, r);
+        
+        // Process complete commands
+        size_t pos;
+        while ((pos = session.cmdBuffer.find('\n')) != std::string::npos) {
+            std::string line = session.cmdBuffer.substr(0, pos);
+            session.cmdBuffer.erase(0, pos + 1);
+            
+            // Trim carriage return if present
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            
+            if (!line.empty()) {
+                Command cmd = parseCommand(line);
+                handleTcpCommand(session, cmd);
+            }
+        }
+    }
+}
+
+// Global state for UDP (simplified for multiplexing)
+std::ofstream g_udpOutFile;
+uint32_t g_udpExpectedSeq = 0;
+
+void processUdpPacket(socket_t s) {
+    sockaddr_in clientAddr{}; socklen_t addrLen = sizeof(clientAddr);
     UdpPacket pkt;
-    socklen_t addrLen = sizeof(clientAddr);
+    int bytes = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
+    if (bytes <= 0) return;
 
-    // Initial ACK for START_CMD
-    {
-        std::lock_guard<std::mutex> lock_sock(g_udpSocketMutex);
+    if (pkt.type == 3) { // START
+        g_udpOutFile.close();
+        g_udpOutFile.open("udp_mpx_" + std::string(pkt.data, pkt.dataSize), std::ios::binary);
+        g_udpExpectedSeq = 0;
         UdpPacket ack{ 0, 1, 0, "" };
         sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
     }
-
-    auto startTime = std::chrono::steady_clock::now();
-    uint64_t totalReceived = 0;
-
-    // Setting a timeout for this thread's reception to handle disconnects
-#ifdef _WIN32
-    DWORD tv = 5000;
-#else
-    struct timeval tv { 5, 0 };
-#endif
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-
-    while (true) {
-        int bytes = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
-        if (bytes <= 0) break; // Timeout or error
-
-        if (pkt.type == 0) { // DATA
-            if (pkt.seq == expectedSeq) {
-                outFile.write(pkt.data, pkt.dataSize);
-                totalReceived += pkt.dataSize;
-                expectedSeq++;
-            }
-            std::lock_guard<std::mutex> lock_sock(g_udpSocketMutex);
-            UdpPacket ack{ expectedSeq - 1, 1, 0, "" };
-            sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
+    else if (pkt.type == 0 && g_udpOutFile.is_open()) { // DATA
+        if (pkt.seq == g_udpExpectedSeq) {
+            g_udpOutFile.write(pkt.data, pkt.dataSize);
+            g_udpExpectedSeq++;
         }
-        else if (pkt.type == 2) { // FIN
-            break;
-        }
+        UdpPacket ack{ g_udpExpectedSeq - 1, 1, 0, "" };
+        sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
     }
-
-    auto endTime = std::chrono::steady_clock::now();
-    double duration = std::chrono::duration<double>(endTime - startTime).count();
-
-    std::lock_guard<std::mutex> lock_out2(g_coutMutex);
-    std::cout << "[UDP Thread] Finished: " << filename << " Bitrate: " << calculateBitrate(totalReceived, duration) << " Mbps" << std::endl;
+    else if (pkt.type == 2) { // FIN
+        g_udpOutFile.close();
+        std::cout << "UDP Multiplexed transfer finished." << std::endl;
+    }
 }
-
-// --- TCP Threaded Handler (Requirement: Threads spawned by request) ---
-
-void handleTcpClient(socket_t cs, std::string ip) {
-    {
-        std::lock_guard<std::mutex> lock(g_coutMutex);
-        std::cout << "[TCP Thread] Connected: " << ip << std::endl;
-    }
-
-    char buffer[BUFFER_SIZE];
-    while (true) {
-        int r = recv(cs, buffer, BUFFER_SIZE - 1, 0);
-        if (r <= 0) break;
-        buffer[r] = '\0';
-
-        Command cmd = parseCommand(buffer);
-        if (cmd.keyword == "ECHO") {
-            std::string msg = (cmd.args.empty() ? "" : cmd.args[0]) + "\n";
-            send(cs, msg.c_str(), (int)msg.length(), 0);
-        }
-        else if (cmd.keyword == "TIME") {
-            time_t now = time(0);
-            std::string t = std::ctime(&now);
-            send(cs, t.c_str(), (int)t.length(), 0);
-        }
-        else if (cmd.keyword == "UPLOAD" && cmd.args.size() >= 2) {
-            std::string filename = cmd.args[0];
-            uint64_t fileSize = std::stoull(cmd.args[1]);
-            send(cs, "RESUME 0\n", 9, 0);
-
-            std::ofstream outFile(filename, std::ios::binary);
-            uint64_t received = 0;
-            while (received < fileSize) {
-                int bytes = recv(cs, buffer, BUFFER_SIZE, 0);
-                if (bytes <= 0) break;
-                outFile.write(buffer, bytes);
-                received += bytes;
-            }
-            std::lock_guard<std::mutex> lock(g_coutMutex);
-            std::cout << "[TCP Thread] Upload finished: " << filename << " from " << ip << std::endl;
-        }
-        else if (cmd.keyword == "EXIT") break;
-    }
-
-    closesocket(cs);
-    std::lock_guard<std::mutex> lock(g_coutMutex);
-    std::cout << "[TCP Thread] Disconnected: " << ip << std::endl;
-}
-
-// --- Server Main Loop ---
 
 void runServer() {
     socket_t tcpSrv = socket(AF_INET, SOCK_STREAM, 0);
     socket_t udpSrv = socket(AF_INET, SOCK_DGRAM, 0);
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY;
 
     addr.sin_port = htons(PORT);
     bind(tcpSrv, (sockaddr*)&addr, sizeof(addr));
@@ -204,46 +235,62 @@ void runServer() {
     addr.sin_port = htons(UDP_PORT);
     bind(udpSrv, (sockaddr*)&addr, sizeof(addr));
 
-    std::cout << "Parallel Server running (Lab 4)..." << std::endl;
+    setNonBlocking(tcpSrv);
+    setNonBlocking(udpSrv);
 
-    // UDP Listener Thread
-    std::thread udpDispatcher([&]() {
-        while (true) {
-            sockaddr_in clientAddr{};
-            socklen_t addrLen = sizeof(clientAddr);
-            UdpPacket pkt;
-            int bytes = recvfrom(udpSrv, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
+    std::vector<ClientSession> clients;
+    std::cout << "Single-threaded Multiplexing Server running..." << std::endl;
 
-            if (bytes > 0 && pkt.type == 3) { // START_CMD received
-                std::string fname(pkt.data, pkt.dataSize);
-                // Spawn a new thread for each UDP file request (Requirement)
-                std::thread(handleUdpTransfer, udpSrv, clientAddr, fname).detach();
+    while (true) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(tcpSrv, &readfds);
+        FD_SET(udpSrv, &readfds);
+
+        socket_t max_fd = (tcpSrv > udpSrv) ? tcpSrv : udpSrv;
+
+        for (const auto& client : clients) {
+            FD_SET(client.socket, &readfds);
+            if (client.socket > max_fd) max_fd = client.socket;
+        }
+
+        // Multiplexing call
+        if (select((int)max_fd + 1, &readfds, NULL, NULL, NULL) < 0) continue;
+
+        // 1. Check for new TCP connections
+        if (FD_ISSET(tcpSrv, &readfds)) {
+            sockaddr_in ca{}; socklen_t cl = sizeof(ca);
+            socket_t cs = accept(tcpSrv, (sockaddr*)&ca, &cl);
+            if (cs != INVALID_SOCKET) {
+                setNonBlocking(cs);
+                char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, INET_ADDRSTRLEN);
+                clients.push_back({ cs, std::string(ip) });
+                std::cout << "New client: " << ip << std::endl;
             }
         }
-        });
-    udpDispatcher.detach();
 
-    // TCP Accept Loop
-    while (true) {
-        sockaddr_in ca{};
-        socklen_t cl = sizeof(ca);
+        // 2. Check for UDP data
+        if (FD_ISSET(udpSrv, &readfds)) {
+            processUdpPacket(udpSrv);
+        }
 
-        // Protection mechanism: although accept is generally thread-safe, 
-        // using a mutex shows understanding of synchronization.
-        g_acceptMutex.lock();
-        socket_t cs = accept(tcpSrv, (sockaddr*)&ca, &cl);
-        g_acceptMutex.unlock();
-
-        if (cs != INVALID_SOCKET) {
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ca.sin_addr, ip, INET_ADDRSTRLEN);
-            // Spawn a new thread for each TCP connection (Requirement)
-            std::thread(handleTcpClient, cs, std::string(ip)).detach();
+        // 3. Check for TCP data from existing clients
+        for (auto it = clients.begin(); it != clients.end(); ) {
+            if (FD_ISSET(it->socket, &readfds)) {
+                processClientData(*it);
+                
+                // Check if socket was closed during processing
+                if (it->socket == INVALID_SOCKET) {
+                    it = clients.erase(it);
+                    continue;
+                }
+            }
+            ++it;
         }
     }
 }
 
-// --- Client Code (Remains compatible with multi-threaded server) ---
+// --- Previous Client Code (Stays mostly the same) ---
 
 void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAddr) {
     std::ifstream file(path, std::ios::binary);
@@ -269,11 +316,7 @@ void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAdd
             }
         }
         UdpPacket ack; sockaddr_in from{}; socklen_t fromLen = sizeof(from);
-#ifdef _WIN32
-        DWORD tv = 200;
-#else
-        struct timeval tv { 0, 200000 };
-#endif
+        struct timeval tv { 0, 100000 };
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
         if (recvfrom(s, (char*)&ack, sizeof(ack), 0, (sockaddr*)&from, &fromLen) > 0) {
             if (ack.type == 1 && ack.seq >= base) base = ack.seq + 1;
@@ -281,12 +324,13 @@ void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAdd
         else {
             for (uint32_t i = base; i < nextSeq; ++i) {
                 UdpPacket& p = window[i % WINDOW_SIZE];
-                sendto(s, (const char*)&p, sizeof(uint32_t) * 3 + p.dataSize, 0, (const sockaddr*)&destAddr, sizeof(destAddr));
+                sendto(s, (const char*)&p, sizeof(uint32_t) * 3 + p.dataSize, 0, (sockaddr*)&destAddr, sizeof(destAddr));
             }
         }
     }
     UdpPacket fin{ 0, 2, 0, "" };
-    sendto(s, (const char*)&fin, sizeof(uint32_t) * 3, 0, (const sockaddr*)&destAddr, sizeof(destAddr));
+    sendto(s, (const char*)&fin, sizeof(uint32_t) * 3, 0, (sockaddr*)&destAddr, sizeof(destAddr));
+    std::cout << "UDP Upload finished." << std::endl;
 }
 
 void runClient(const char* ip) {
@@ -312,6 +356,7 @@ void runClient(const char* ip) {
             send(ts, h.c_str(), (int)h.length(), 0);
             char b[BUFFER_SIZE];
             while (f.read(b, BUFFER_SIZE) || f.gcount() > 0) send(ts, b, (int)f.gcount(), 0);
+            std::cout << "TCP Upload initiated." << std::endl;
         }
         else {
             send(ts, (line + "\n").c_str(), (int)line.length() + 1, 0);
