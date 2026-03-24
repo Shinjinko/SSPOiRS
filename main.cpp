@@ -8,15 +8,15 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdint>
-#include <map>
+#include <thread>
+#include <mutex>
 #include <cstring>
 #include <ctime>
-#include <fcntl.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <mstcpip.h> // Для tcp_keepalive в Windows
+#include <mstcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef SOCKET socket_t;
 typedef int socklen_t;
@@ -24,7 +24,7 @@ typedef int socklen_t;
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h> // Для TCP_KEEPIDLE в Linux
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
@@ -36,88 +36,27 @@ typedef int socket_t;
 #define closesocket close
 #endif
 
-// Constants
 const int PORT = 12345;
 const int UDP_PORT = 12346;
 const int BUFFER_SIZE = 4096;
 const int UDP_PAYLOAD_SIZE = 1460;
 const int WINDOW_SIZE = 16;
 
+std::mutex g_coutMutex;
+
 #pragma pack(push, 1)
 struct UdpPacket {
     uint32_t seq;
-    uint32_t type; // 0: DATA, 1: ACK, 2: FIN, 3: START_CMD
+    uint32_t type;         
     uint32_t dataSize;
     char data[UDP_PAYLOAD_SIZE];
 };
 #pragma pack(pop)
 
-// Структура для TCP-сессий
-struct ClientSession {
-    socket_t socket;
-    std::string ip;
-    std::string cmdBuffer;
-
-    // Состояние UPLOAD (от клиента к серверу)
-    bool isUploading = false;
-    std::ofstream outFile;
-    uint64_t bytesReceived = 0;
-
-    // Состояние DOWNLOAD (от сервера к клиенту)
-    bool isDownloading = false;
-    std::ifstream inFile;
-    uint64_t bytesSent = 0;
-
-    uint64_t fileSize = 0;
-    std::string currentFileName;
-    std::chrono::steady_clock::time_point startTime;
-};
-
-// Структура для независимых UDP-сессий (Решает проблему глобальных переменных)
-struct UdpSession {
-    std::ofstream outFile;
-    uint32_t expectedSeq = 0;
-};
-// Словарь активных UDP-передач. Ключ - строка "IP:PORT"
-std::map<std::string, UdpSession> udpSessions;
-
 struct Command {
     std::string keyword;
     std::vector<std::string> args;
 };
-
-// --- Utility Functions ---
-
-void setNonBlocking(socket_t s) {
-#ifdef _WIN32
-    unsigned long mode = 1;
-    ioctlsocket(s, FIONBIO, &mode);
-#else
-    fcntl(s, F_SETFL, O_NONBLOCK);
-#endif
-}
-
-// Настройка SO_KEEPALIVE для быстрого обнаружения обрывов связи (30 сек)
-void enableKeepAlive(socket_t s) {
-    int optval = 1;
-    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&optval, sizeof(optval));
-
-#ifdef _WIN32
-    struct tcp_keepalive alive;
-    alive.onoff = 1;
-    alive.keepalivetime = 30000;    // 30 секунд бездействия до первой проверки
-    alive.keepaliveinterval = 5000; // 5 секунд между повторными проверками
-    DWORD dwBytesRet = 0;
-    WSAIoctl(s, SIO_KEEPALIVE_VALS, &alive, sizeof(alive), NULL, 0, &dwBytesRet, NULL, NULL);
-#else
-    int idle = 30;     // Время простоя
-    int interval = 5;  // Интервал
-    int maxpkt = 3;    // Кол-во попыток
-    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &maxpkt, sizeof(maxpkt));
-#endif
-}
 
 Command parseCommand(const std::string& line) {
     std::istringstream iss(line);
@@ -140,188 +79,222 @@ std::string getBasename(const std::string& path) {
     return (std::string::npos != last_slash) ? path.substr(last_slash + 1) : path;
 }
 
-std::string getAddrString(const sockaddr_in& addr) {
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
-    return std::string(ip) + ":" + std::to_string(ntohs(addr.sin_port));
+void setSocketTimeout(socket_t s, int ms) {
+#ifdef _WIN32
+    DWORD tv = ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
 }
 
-// --- Обработка TCP ---
-
-void handleTcpCommand(ClientSession& session, const Command& cmd) {
-    if (cmd.keyword == "ECHO") {
-        std::string msg = "ECHO: " + (cmd.args.empty() ? "" : cmd.args[0]) + "\n";
-        send(session.socket, msg.c_str(), (int)msg.length(), 0);
-    }
-    else if (cmd.keyword == "TIME") {
-        time_t now = time(0);
-        std::string t = std::ctime(&now);
-        send(session.socket, t.c_str(), (int)t.length(), 0);
-    }
-    else if (cmd.keyword == "UPLOAD" && cmd.args.size() >= 2) {
-        session.currentFileName = getBasename(cmd.args[0]);
-        session.fileSize = std::stoull(cmd.args[1]);
-        session.isUploading = true;
-        session.bytesReceived = 0;
-        session.outFile.open(session.currentFileName, std::ios::binary | std::ios::trunc);
-        session.startTime = std::chrono::steady_clock::now();
-
-        std::string res = "READY\n";
-        send(session.socket, res.c_str(), (int)res.length(), 0);
-    }
-    // НОВАЯ ЛОГИКА: Команда на скачивание (DOWNLOAD)
-    else if (cmd.keyword == "DOWNLOAD" && cmd.args.size() >= 1) {
-        std::string filename = getBasename(cmd.args[0]);
-        session.inFile.open(filename, std::ios::binary | std::ios::ate);
-        if (session.inFile.is_open()) {
-            session.fileSize = session.inFile.tellg(); // Узнаем размер файла
-            session.inFile.seekg(0);                   // Возвращаемся в начало
-            session.isDownloading = true;
-            session.bytesSent = 0;
-            session.currentFileName = filename;
-            session.startTime = std::chrono::steady_clock::now();
-
-            std::string res = "READY " + std::to_string(session.fileSize) + "\n";
-            send(session.socket, res.c_str(), (int)res.length(), 0);
-            std::cout << "Started sending " << filename << " to " << session.ip << std::endl;
-        }
-        else {
-            std::string res = "FILE_NOT_FOUND\n";
-            send(session.socket, res.c_str(), (int)res.length(), 0);
-        }
-    }
-    else if (cmd.keyword == "EXIT" || cmd.keyword == "QUIT" || cmd.keyword == "CLOSE") {
-        std::string msg = "GOODBYE\n";
-        send(session.socket, msg.c_str(), (int)msg.length(), 0);
-        closesocket(session.socket);
-        session.socket = INVALID_SOCKET;
-    }
-    else {
-        std::string msg = "UNKNOWN_COMMAND: " + cmd.keyword + "\n";
-        send(session.socket, msg.c_str(), (int)msg.length(), 0);
-    }
+void enableKeepAlive(socket_t s) {
+    int optval = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&optval, sizeof(optval));
+#ifdef _WIN32
+    struct tcp_keepalive alive;
+    alive.onoff = 1;
+    alive.keepalivetime = 30000;
+    alive.keepaliveinterval = 5000;
+    DWORD dwBytesRet = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &alive, sizeof(alive), NULL, 0, &dwBytesRet, NULL, NULL);
+#else
+    int idle = 30, interval = 5, maxpkt = 3;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &maxpkt, sizeof(maxpkt));
+#endif
 }
 
-void processClientData(ClientSession& session) {
+void handleTcpClient(socket_t cs, std::string ip) {
+    {
+        std::lock_guard<std::mutex> lock(g_coutMutex);
+        std::cout << "[TCP] New connection from: " << ip << std::endl;
+    }
+
+    enableKeepAlive(cs);
+
+    std::string cmdBuffer;
     char buffer[BUFFER_SIZE];
-    int r = recv(session.socket, buffer, BUFFER_SIZE, 0);
+    bool connected = true;
 
-    if (r <= 0) {
-        std::cout << "Client disconnected or error: " << session.ip << std::endl;
-        if (session.isUploading) session.outFile.close();
-        if (session.isDownloading) session.inFile.close();
-        closesocket(session.socket);
-        session.socket = INVALID_SOCKET;
-        return;
-    }
+    while (connected) {
+        int r = recv(cs, buffer, BUFFER_SIZE, 0);
+        if (r <= 0) break;   
 
-    if (session.isUploading) {
-        session.outFile.write(buffer, r);
-        session.bytesReceived += r;
-        if (session.bytesReceived >= session.fileSize) {
-            session.isUploading = false;
-            session.outFile.close();
-            auto end = std::chrono::steady_clock::now();
-            double duration = std::chrono::duration<double>(end - session.startTime).count();
-            std::cout << "TCP Upload Finished: " << session.currentFileName << " at "
-                << calculateBitrate(session.fileSize, duration) << " Mbps" << std::endl;
+        cmdBuffer.append(buffer, r);
 
-            std::string msg = "UPLOAD_COMPLETE\n";
-            send(session.socket, msg.c_str(), (int)msg.length(), 0);
-        }
-    }
-    else {
-        session.cmdBuffer.append(buffer, r);
-        size_t pos;
-        while ((pos = session.cmdBuffer.find('\n')) != std::string::npos) {
-            std::string line = session.cmdBuffer.substr(0, pos);
-            session.cmdBuffer.erase(0, pos + 1);
+        while (!cmdBuffer.empty()) {
+            size_t pos = cmdBuffer.find('\n');
+            if (pos == std::string::npos) break;    
+
+            std::string line = cmdBuffer.substr(0, pos);
+            cmdBuffer.erase(0, pos + 1);
             if (!line.empty() && line.back() == '\r') line.pop_back();
 
-            if (!line.empty()) {
-                Command cmd = parseCommand(line);
-                handleTcpCommand(session, cmd);
+            if (line.empty()) continue;
+
+            Command cmd = parseCommand(line);
+
+            if (cmd.keyword == "ECHO") {
+                std::string msg = "ECHO: " + (cmd.args.empty() ? "" : cmd.args[0]) + "\n";
+                send(cs, msg.c_str(), (int)msg.length(), 0);
+            }
+            else if (cmd.keyword == "TIME") {
+                time_t now = time(0);
+                std::string t = std::ctime(&now);
+                send(cs, t.c_str(), (int)t.length(), 0);
+            }
+            else if (cmd.keyword == "DOWNLOAD" && cmd.args.size() >= 1) {
+                std::string filename = getBasename(cmd.args[0]);
+                std::ifstream inFile(filename, std::ios::binary | std::ios::ate);
+
+                if (inFile.is_open()) {
+                    uint64_t fileSize = inFile.tellg();
+                    inFile.seekg(0);
+
+                    std::string res = "READY " + std::to_string(fileSize) + "\n";
+                    send(cs, res.c_str(), (int)res.length(), 0);
+
+                    uint64_t sent = 0;
+                    char fileBuf[BUFFER_SIZE];
+                    while (sent < fileSize) {
+                        inFile.read(fileBuf, BUFFER_SIZE);
+                        int bytesRead = (int)inFile.gcount();
+                        if (bytesRead <= 0) break;
+                        send(cs, fileBuf, bytesRead, 0);      
+                        sent += bytesRead;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_coutMutex);
+                        std::cout << "[TCP] Sent " << filename << " to " << ip << std::endl;
+                    }
+                }
+                else {
+                    std::string res = "FILE_NOT_FOUND\n";
+                    send(cs, res.c_str(), (int)res.length(), 0);
+                }
+            }
+            else if (cmd.keyword == "UPLOAD" && cmd.args.size() >= 2) {
+                std::string filename = getBasename(cmd.args[0]);
+                uint64_t fileSize = std::stoull(cmd.args[1]);
+                std::ofstream outFile("tcp_upl_" + filename, std::ios::binary);
+
+                std::string res = "READY\n";
+                send(cs, res.c_str(), (int)res.length(), 0);
+
+                uint64_t received = 0;
+                auto start = std::chrono::steady_clock::now();
+
+                uint64_t remaining = fileSize - received;
+                uint64_t toWrite = (std::min)((uint64_t)cmdBuffer.size(), remaining);
+                if (toWrite > 0) {
+                    outFile.write(cmdBuffer.data(), toWrite);
+                    received += toWrite;
+                    cmdBuffer.erase(0, toWrite);
+                }
+
+                while (received < fileSize) {
+                    int bytes = recv(cs, buffer, BUFFER_SIZE, 0);
+                    if (bytes <= 0) { connected = false; break; }
+
+                    remaining = fileSize - received;
+                    toWrite = (std::min)((uint64_t)bytes, remaining);
+                    outFile.write(buffer, toWrite);
+                    received += toWrite;
+
+                    if (bytes > toWrite) {
+                        cmdBuffer.append(buffer + toWrite, bytes - toWrite);
+                    }
+                }
+                outFile.close();
+
+                auto end = std::chrono::steady_clock::now();
+                double duration = std::chrono::duration<double>(end - start).count();
+
+                std::string comp = "UPLOAD_COMPLETE\n";
+                send(cs, comp.c_str(), (int)comp.length(), 0);
+
+                std::lock_guard<std::mutex> lock(g_coutMutex);
+                std::cout << "[TCP] Received " << filename << " at " << calculateBitrate(fileSize, duration) << " Mbps\n";
+            }
+            else if (cmd.keyword == "EXIT" || cmd.keyword == "QUIT") {
+                send(cs, "GOODBYE\n", 8, 0);
+                connected = false;
+                break;
+            }
+            else {
+                std::string msg = "UNKNOWN_COMMAND\n";
+                send(cs, msg.c_str(), (int)msg.length(), 0);
             }
         }
     }
+    closesocket(cs);
+    std::lock_guard<std::mutex> lock(g_coutMutex);
+    std::cout << "[TCP] Disconnected: " << ip << std::endl;
 }
 
-// НОВАЯ ЛОГИКА: Неблокирующая отправка файла клиенту (DOWNLOAD)
-void processClientDownload(ClientSession& session) {
-    char buffer[BUFFER_SIZE];
-    session.inFile.read(buffer, BUFFER_SIZE);
-    int bytesRead = (int)session.inFile.gcount();
+void handleUdpTransfer(sockaddr_in clientAddr, std::string filename) {
+    socket_t threadSock = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in localAddr{};
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = INADDR_ANY;
+    localAddr.sin_port = 0;       
+    bind(threadSock, (sockaddr*)&localAddr, sizeof(localAddr));
 
-    if (bytesRead > 0) {
-        int sent = send(session.socket, buffer, bytesRead, 0);
-        if (sent > 0) {
-            session.bytesSent += sent;
-            // Если сокет "задохнулся" и отправил не весь чанк - возвращаем курсор файла
-            if (sent < bytesRead) {
-                session.inFile.seekg((uint64_t)session.inFile.tellg() - (bytesRead - sent));
-            }
-        }
-        else {
-            // EAGAIN/EWOULDBLOCK, откатываем чтение файла на следующую итерацию
-            session.inFile.seekg((uint64_t)session.inFile.tellg() - bytesRead);
-        }
-    }
+    setSocketTimeout(threadSock, 5000);       
 
-    if (session.bytesSent >= session.fileSize) {
-        session.isDownloading = false;
-        session.inFile.close();
-        auto end = std::chrono::steady_clock::now();
-        double duration = std::chrono::duration<double>(end - session.startTime).count();
-        std::cout << "TCP Download Finished for " << session.ip << " at "
-            << calculateBitrate(session.fileSize, duration) << " Mbps" << std::endl;
-    }
-}
-
-// --- Обработка UDP (Словарь сессий) ---
-
-void processUdpPacket(socket_t s) {
-    sockaddr_in clientAddr{}; socklen_t addrLen = sizeof(clientAddr);
+    std::ofstream outFile("udp_th_" + filename, std::ios::binary);
+    uint32_t expectedSeq = 0;
     UdpPacket pkt;
-    int bytes = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
-    if (bytes <= 0) return;
+    socklen_t addrLen = sizeof(clientAddr);
 
-    std::string clientKey = getAddrString(clientAddr); // Получаем IP:PORT клиента как строку
+    UdpPacket ack{ 0, 1, 0, "" };
+    sendto(threadSock, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
 
-    if (pkt.type == 3) { // START
-        if (udpSessions.count(clientKey)) {
-            udpSessions[clientKey].outFile.close(); // Закрываем старый файл если был сбой
+    uint64_t totalReceived = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    while (true) {
+        int bytes = recvfrom(threadSock, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
+        if (bytes <= 0) break;    
+
+        if (pkt.type == 0) {  
+            if (pkt.seq == expectedSeq) {
+                outFile.write(pkt.data, pkt.dataSize);
+                totalReceived += pkt.dataSize;
+                expectedSeq++;
+            }
+            ack = { expectedSeq - 1, 1, 0, "" };
+            sendto(threadSock, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
         }
-        udpSessions[clientKey].outFile.open("udp_mpx_" + std::string(pkt.data, pkt.dataSize), std::ios::binary);
-        udpSessions[clientKey].expectedSeq = 0;
-
-        UdpPacket ack{ 0, 1, 0, "" };
-        sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
-    }
-    else if (pkt.type == 0 && udpSessions.count(clientKey) && udpSessions[clientKey].outFile.is_open()) { // DATA
-        UdpSession& session = udpSessions[clientKey];
-        if (pkt.seq == session.expectedSeq) {
-            session.outFile.write(pkt.data, pkt.dataSize);
-            session.expectedSeq++;
-        }
-        UdpPacket ack{ session.expectedSeq - 1, 1, 0, "" };
-        sendto(s, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
-    }
-    else if (pkt.type == 2) { // FIN
-        if (udpSessions.count(clientKey)) {
-            udpSessions[clientKey].outFile.close();
-            udpSessions.erase(clientKey); // Очищаем сессию
-            std::cout << "UDP Multiplexed transfer finished for: " << clientKey << std::endl;
+        else if (pkt.type == 2) {  
+            ack = { 0, 2, 0, "" };
+            sendto(threadSock, (char*)&ack, sizeof(uint32_t) * 3, 0, (sockaddr*)&clientAddr, addrLen);
+            break;
         }
     }
+
+    outFile.close();
+    closesocket(threadSock);
+
+    auto endTime = std::chrono::steady_clock::now();
+    double duration = std::chrono::duration<double>(endTime - startTime).count();
+
+    std::lock_guard<std::mutex> lock_out(g_coutMutex);
+    std::cout << "[UDP Thread] Finished: " << filename << " at " << calculateBitrate(totalReceived, duration) << " Mbps\n";
 }
-
-// --- Главный цикл сервера ---
 
 void runServer() {
     socket_t tcpSrv = socket(AF_INET, SOCK_STREAM, 0);
     socket_t udpSrv = socket(AF_INET, SOCK_DGRAM, 0);
 
-    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
 
     addr.sin_port = htons(PORT);
     bind(tcpSrv, (sockaddr*)&addr, sizeof(addr));
@@ -330,81 +303,41 @@ void runServer() {
     addr.sin_port = htons(UDP_PORT);
     bind(udpSrv, (sockaddr*)&addr, sizeof(addr));
 
-    setNonBlocking(tcpSrv);
-    setNonBlocking(udpSrv);
+    std::cout << "Multi-threaded Server (Lab 4) running..." << std::endl;
 
-    std::vector<ClientSession> clients;
-    std::cout << "Single-threaded Multiplexing Server running..." << std::endl;
+    std::thread udpDispatcher([&]() {
+        while (true) {
+            sockaddr_in clientAddr{};
+            socklen_t addrLen = sizeof(clientAddr);
+            UdpPacket pkt;
+            int bytes = recvfrom(udpSrv, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&clientAddr, &addrLen);
+
+            if (bytes > 0 && pkt.type == 3) {
+                std::string fname(pkt.data, pkt.dataSize);
+                {
+                    std::lock_guard<std::mutex> lock(g_coutMutex);
+                    std::cout << "[UDP Dispatcher] Spawning thread for: " << fname << std::endl;
+                }
+                std::thread(handleUdpTransfer, clientAddr, fname).detach();
+            }
+        }
+        });
+    udpDispatcher.detach();
 
     while (true) {
-        fd_set readfds, writefds;
-        FD_ZERO(&readfds);
-        FD_ZERO(&writefds); // Теперь мы слушаем и на чтение, и на запись
+        sockaddr_in ca{};
+        socklen_t cl = sizeof(ca);
+        socket_t cs = accept(tcpSrv, (sockaddr*)&ca, &cl);   
 
-        FD_SET(tcpSrv, &readfds);
-        FD_SET(udpSrv, &readfds);
-
-        socket_t max_fd = (tcpSrv > udpSrv) ? tcpSrv : udpSrv;
-
-        for (const auto& client : clients) {
-            FD_SET(client.socket, &readfds); // Всех слушаем на входящие (команды или UPLOAD)
-            if (client.isDownloading) {
-                FD_SET(client.socket, &writefds); // На отправку слушаем только если идет DOWNLOAD
-            }
-            if (client.socket > max_fd) max_fd = client.socket;
-        }
-
-        // Обновленный вызов select (отслеживает как readfds, так и writefds)
-        if (select((int)max_fd + 1, &readfds, &writefds, NULL, NULL) < 0) continue;
-
-        // 1. Новое TCP подключение
-        if (FD_ISSET(tcpSrv, &readfds)) {
-            sockaddr_in ca{}; socklen_t cl = sizeof(ca);
-            socket_t cs = accept(tcpSrv, (sockaddr*)&ca, &cl);
-            if (cs != INVALID_SOCKET) {
-                setNonBlocking(cs);
-                enableKeepAlive(cs); // Включаем SO_KEEPALIVE для быстрого обнаружения обрывов
-                char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, INET_ADDRSTRLEN);
-                clients.push_back({ cs, std::string(ip) });
-                std::cout << "New client: " << ip << std::endl;
-            }
-        }
-
-        // 2. Новые UDP данные
-        if (FD_ISSET(udpSrv, &readfds)) {
-            processUdpPacket(udpSrv);
-        }
-
-        // 3. Обработка существующих TCP клиентов (Чтение + Запись)
-        auto it = clients.begin();
-        while (it != clients.end()) {
-            bool socketClosed = false;
-
-            // Если есть данные для чтения (поступила команда или чанк UPLOAD файла)
-            if (FD_ISSET(it->socket, &readfds)) {
-                processClientData(*it);
-                if (it->socket == INVALID_SOCKET) socketClosed = true;
-            }
-
-            // Если сокет готов принимать данные и у нас включен режим DOWNLOAD
-            if (!socketClosed && it->isDownloading && FD_ISSET(it->socket, &writefds)) {
-                processClientDownload(*it);
-                if (it->socket == INVALID_SOCKET) socketClosed = true;
-            }
-
-            if (socketClosed) {
-                it = clients.erase(it);
-            }
-            else {
-                ++it;
-            }
+        if (cs != INVALID_SOCKET) {
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ca.sin_addr, ip, INET_ADDRSTRLEN);
+            std::thread(handleTcpClient, cs, std::string(ip)).detach();
         }
     }
 }
 
-// --- Клиентская часть ---
-
-void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAddr) {
+void udpSendFile(socket_t s, const std::string& path, sockaddr_in destAddr) {
     std::ifstream file(path, std::ios::binary);
     if (!file) return;
 
@@ -412,10 +345,31 @@ void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAdd
     std::string name = getBasename(path);
     memcpy(start.data, name.c_str(), (std::min)((size_t)UDP_PAYLOAD_SIZE, name.length()));
     start.dataSize = (uint32_t)name.length();
-    sendto(s, (const char*)&start, sizeof(uint32_t) * 3 + start.dataSize, 0, (sockaddr*)&destAddr, sizeof(destAddr));
 
+    UdpPacket ack; sockaddr_in from{}; socklen_t fromLen = sizeof(from);
+    setSocketTimeout(s, 500);
+
+    bool sessionEstablished = false;
+    for (int i = 0; i < 5; ++i) {     
+        sendto(s, (const char*)&start, sizeof(uint32_t) * 3 + start.dataSize, 0, (sockaddr*)&destAddr, sizeof(destAddr));
+        if (recvfrom(s, (char*)&ack, sizeof(ack), 0, (sockaddr*)&from, &fromLen) > 0) {
+            if (ack.type == 1) {   
+                destAddr.sin_port = from.sin_port;      
+                sessionEstablished = true;
+                break;
+            }
+        }
+    }
+
+    if (!sessionEstablished) {
+        std::cout << "UDP Server not responding.\n";
+        return;
+    }
+
+    setSocketTimeout(s, 100);
     uint32_t nextSeq = 0, base = 0;
     std::vector<UdpPacket> window(WINDOW_SIZE);
+
     while (!file.eof() || base < nextSeq) {
         while (nextSeq < base + WINDOW_SIZE && !file.eof()) {
             UdpPacket& pkt = window[nextSeq % WINDOW_SIZE];
@@ -427,9 +381,7 @@ void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAdd
                 nextSeq++;
             }
         }
-        UdpPacket ack; sockaddr_in from{}; socklen_t fromLen = sizeof(from);
-        struct timeval tv { 0, 100000 };
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
         if (recvfrom(s, (char*)&ack, sizeof(ack), 0, (sockaddr*)&from, &fromLen) > 0) {
             if (ack.type == 1 && ack.seq >= base) base = ack.seq + 1;
         }
@@ -440,6 +392,7 @@ void udpSendFile(socket_t s, const std::string& path, const sockaddr_in& destAdd
             }
         }
     }
+
     UdpPacket fin{ 0, 2, 0, "" };
     sendto(s, (const char*)&fin, sizeof(uint32_t) * 3, 0, (sockaddr*)&destAddr, sizeof(destAddr));
     std::cout << "UDP Upload finished." << std::endl;
@@ -449,7 +402,6 @@ void runClient(const char* ip) {
     socket_t ts = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(PORT); inet_pton(AF_INET, ip, &sa.sin_addr);
 
-    // Включаем SO_KEEPALIVE и на клиенте тоже, чтобы он реагировал на падение сервера
     enableKeepAlive(ts);
 
     if (connect(ts, (sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
@@ -457,7 +409,7 @@ void runClient(const char* ip) {
         return;
     }
 
-    std::cout << "Commands: ECHO, TIME, UPLOAD <path>, DOWNLOAD <filename>, UDP_UPLOAD <path>, EXIT" << std::endl;
+    std::cout << "Commands: ECHO, TIME, UPLOAD <path>, DOWNLOAD <filename>, UDP_UPLOAD <path>, EXIT\n";
     std::string line;
 
     while (std::getline(std::cin, line)) {
@@ -471,25 +423,37 @@ void runClient(const char* ip) {
         }
         else if (cmd.keyword == "UPLOAD" && !cmd.args.empty()) {
             std::ifstream f(cmd.args[0], std::ios::binary | std::ios::ate);
-            if (!f) continue;
+            if (!f) { std::cout << "File not found!\n"; continue; }
             uint64_t sz = f.tellg(); f.seekg(0);
+
             std::string h = "UPLOAD " + getBasename(cmd.args[0]) + " " + std::to_string(sz) + "\n";
             send(ts, h.c_str(), (int)h.length(), 0);
 
+            std::string respLine; char c;
+            while (recv(ts, &c, 1, 0) > 0 && c != '\n') { if (c != '\r') respLine += c; }
+            if (respLine != "READY") { std::cout << "Error: " << respLine << "\n"; continue; }
+
             char b[BUFFER_SIZE];
-            while (f.read(b, BUFFER_SIZE) || f.gcount() > 0) send(ts, b, (int)f.gcount(), 0);
-            std::cout << "TCP Upload initiated (synchronous on client)." << std::endl;
+            auto start = std::chrono::steady_clock::now();
+            while (!f.eof()) {
+                f.read(b, BUFFER_SIZE);
+                std::streamsize bytes = f.gcount();
+                if (bytes > 0) send(ts, b, (int)bytes, 0);
+            }
+
+            respLine.clear();
+            while (recv(ts, &c, 1, 0) > 0 && c != '\n') { if (c != '\r') respLine += c; }
+
+            auto end = std::chrono::steady_clock::now();
+            double duration = std::chrono::duration<double>(end - start).count();
+            std::cout << "Server: " << respLine << " at " << calculateBitrate(sz, duration) << " Mbps\n";
         }
         else if (cmd.keyword == "DOWNLOAD" && !cmd.args.empty()) {
             std::string h = "DOWNLOAD " + cmd.args[0] + "\n";
             send(ts, h.c_str(), (int)h.length(), 0);
 
-            // Читаем первую строку ответа (до \n)
-            std::string respLine;
-            char c;
-            while (recv(ts, &c, 1, 0) > 0 && c != '\n') {
-                if (c != '\r') respLine += c;
-            }
+            std::string respLine; char c;
+            while (recv(ts, &c, 1, 0) > 0 && c != '\n') { if (c != '\r') respLine += c; }
 
             Command resp = parseCommand(respLine);
             if (resp.keyword == "READY" && resp.args.size() >= 1) {
@@ -498,23 +462,20 @@ void runClient(const char* ip) {
                 uint64_t recvd = 0;
                 char b[BUFFER_SIZE];
 
-                std::cout << "Downloading " << sz << " bytes..." << std::endl;
                 auto start = std::chrono::steady_clock::now();
-
                 while (recvd < sz) {
-                    int toRead = std::min((uint64_t)BUFFER_SIZE, sz - recvd);
+                    int toRead = (std::min)((uint64_t)BUFFER_SIZE, sz - recvd);
                     int r = recv(ts, b, toRead, 0);
                     if (r <= 0) break;
                     f.write(b, r);
                     recvd += r;
                 }
-
                 auto end = std::chrono::steady_clock::now();
                 double duration = std::chrono::duration<double>(end - start).count();
-                std::cout << "TCP Download finished at " << calculateBitrate(sz, duration) << " Mbps" << std::endl;
+                std::cout << "Download finished at " << calculateBitrate(sz, duration) << " Mbps\n";
             }
             else {
-                std::cout << "Server: " << respLine << std::endl;
+                std::cout << "Server: " << respLine << "\n";
             }
         }
         else {
